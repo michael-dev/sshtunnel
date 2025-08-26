@@ -540,6 +540,27 @@ class SSHTunnelForwarder(object):
 
             Default: current local user name
 
+        ssh_kerberos_auth (bool):
+            True if kerberos authentication is enabled for user.
+
+            Default: False
+            
+            .. versionadded:: 0.5.0
+
+        ssh_kerberos_deleg (bool):
+            True if delegation for kerberos authentication is enabled
+
+            Default: False
+            
+            .. versionadded:: 0.5.0
+
+        ssh_kerberos_hostauth (bool):
+            True if kerberos authentication is enabled for host key validation.
+
+            Default: False
+            
+            .. versionadded:: 0.5.0
+
         ssh_password (str):
             Text representing the password used to connect to ``REMOTE
             SERVER`` or for unlocking a private key.
@@ -901,6 +922,9 @@ class SSHTunnelForwarder(object):
             compression=None,
             allow_agent=True,  # look for keys from an SSH agent
             host_pkey_directories=None,  # look for keys in ~/.ssh
+            ssh_kerberos_auth=None,
+            ssh_kerberos_hostauth=None,
+            ssh_kerberos_deleg=None,
             *args,
             **kwargs  # for backwards compatibility
     ):
@@ -952,7 +976,10 @@ class SSHTunnelForwarder(object):
          ssh_pkey,  # still needs to go through _consolidate_auth
          self.ssh_port,
          self.ssh_proxy,
-         self.compression) = self._read_ssh_config(
+         self.compression,
+         self.ssh_kerberos_auth,
+         self.ssh_kerberos_hostauth,
+         self.ssh_kerberos_deleg) = self._read_ssh_config(
              ssh_host,
              ssh_config_file,
              ssh_username,
@@ -960,6 +987,9 @@ class SSHTunnelForwarder(object):
              ssh_port,
              ssh_proxy if ssh_proxy_enabled else None,
              compression,
+             ssh_kerberos_auth,
+             ssh_kerberos_hostauth,
+             ssh_kerberos_deleg,
              self.logger
         )
 
@@ -969,7 +999,8 @@ class SSHTunnelForwarder(object):
             ssh_pkey_password=ssh_private_key_password,
             allow_agent=allow_agent,
             host_pkey_directories=host_pkey_directories,
-            logger=self.logger
+            logger=self.logger,
+            ssh_kerberos_auth=self.ssh_kerberos_auth
         )
 
         check_host(self.ssh_host)
@@ -991,6 +1022,9 @@ class SSHTunnelForwarder(object):
                          ssh_port=None,
                          ssh_proxy=None,
                          compression=None,
+                         ssh_kerberos_auth=None,
+                         ssh_kerberos_hostauth=None,
+                         ssh_kerberos_deleg=None,
                          logger=None):
         """
         Read ssh_config_file and tries to look for user (ssh_username),
@@ -1027,6 +1061,16 @@ class SSHTunnelForwarder(object):
             if compression is None:
                 compression = hostname_info.get('compression', '')
                 compression = True if compression.upper() == 'YES' else False
+
+            if ssh_kerberos_auth is None:
+                ssh_kerberos_auth = hostname_info.get('GSSAPIAuthentication')
+                if ssh_kerberos_auth is not None:
+                    ssh_kerberos_auth = (ssh_kerberos_auth.upper() == 'YES');
+            if ssh_kerberos_hostauth is None:
+                ssh_kerberos_hostauth = False
+            if ssh_kerberos_deleg is None:
+                ssh_kerberos_deleg = False
+
         except IOError:
             if logger:
                 logger.warning(
@@ -1042,7 +1086,10 @@ class SSHTunnelForwarder(object):
                     ssh_pkey,
                     int(ssh_port) if ssh_port else 22,  # fallback value
                     ssh_proxy,
-                    compression)
+                    compression,
+                    ssh_kerberos_auth,
+                    ssh_kerberos_hostauth,
+                    ssh_kerberos_deleg)
 
     @staticmethod
     def get_agent_keys(logger=None):
@@ -1136,7 +1183,8 @@ class SSHTunnelForwarder(object):
                           ssh_pkey_password=None,
                           allow_agent=True,
                           host_pkey_directories=None,
-                          logger=None):
+                          logger=None,
+                          ssh_kerberos_auth=None):
         """
         Get sure authentication information is in place.
         ``ssh_pkey`` may be of classes:
@@ -1165,8 +1213,8 @@ class SSHTunnelForwarder(object):
         if isinstance(ssh_pkey, paramiko.pkey.PKey):
             ssh_loaded_pkeys.insert(0, ssh_pkey)
 
-        if not ssh_password and not ssh_loaded_pkeys:
-            raise ValueError('No password or public key available!')
+        if not ssh_password and not ssh_loaded_pkeys and not ssh_kerberos_auth:
+            raise ValueError('No password or public key or kerberos available!')
         return (ssh_password, ssh_loaded_pkeys)
 
     def _raise(self, exception=BaseSSHTunnelForwarderError, reason=None):
@@ -1392,10 +1440,26 @@ class SSHTunnelForwarder(object):
     def _connect_to_gateway(self):
         """
         Open connection to SSH gateway
-         - First try with all keys loaded from an SSH agent (if allowed)
+         - First try with kerberos (if allowed)
+         - Then with all keys loaded from an SSH agent (if allowed)
          - Then with those passed directly or read from ~/.ssh/config
          - As last resort, try with a provided password
         """
+        if self.ssh_kerberos_auth:
+            self.logger.debug('Trying to log in with kerberos')
+            try:
+                self._transport = self._get_transport()
+                self._transport.connect(hostkey=self.ssh_host_key,
+                                        username=self.ssh_username,
+                                        gss_auth=True,
+                                        gss_kex=self.ssh_kerberos_hostauth,
+                                        gss_deleg_creds=self.ssh_kerberos_deleg)
+                if self._transport.is_alive:
+                    return
+            except paramiko.AuthenticationException:
+                self.logger.debug('Authentication error')
+                self._stop_transport()
+
         for key in self.ssh_pkeys:
             self.logger.debug('Trying to log in with key: {0}'
                               .format(hexlify(key.get_fingerprint())))
@@ -1564,7 +1628,10 @@ class SSHTunnelForwarder(object):
             'password': self.ssh_password,
             'pkeys': [(key.get_name(), hexlify(key.get_fingerprint()))
                       for key in self.ssh_pkeys]
-            if any(self.ssh_pkeys) else None
+            if any(self.ssh_pkeys) else None,
+            'kerberos_auth': str(self.ssh_kerberos_auth),
+            'kerberos_hostauth': str(self.ssh_kerberos_hostauth),
+            'kerberos_deleg': str(self.ssh_kerberos_deleg)
         }
         _remove_none_values(credentials)
         template = os.linesep.join(['{0} object',
@@ -1876,6 +1943,28 @@ def _parse_arguments(args=None):
         help='List of directories where SSH pkeys (in the format `id_*`) '
              'may be found'
     )
+    
+    parser.add_argument(
+        '--kerberos-auth',
+        dest='ssh_kerberos_auth',
+        action='store_true',
+        help='Allow kerberos auth'
+    )
+
+    parser.add_argument(
+        '--kerberos-hostauth',
+        dest='ssh_kerberos_hostauth',
+        action='store_true',
+        help='Allow kerberos auth for host'
+    )
+
+    parser.add_argument(
+        '--kerberos-deleg',
+        dest='ssh_kerberos_deleg',
+        action='store_true',
+        help='Allow kerberos auth delegation'
+    )
+
     return vars(parser.parse_args(args))
 
 
@@ -1900,6 +1989,9 @@ def _cli_main(args=None, **extras):
         -z (compress)
         -n (noagent), disable looking for keys from an Agent
         -d (host_pkey_directories), look for keys on these folders
+        --kerberos-auth, enables kerberos auth
+        --kerberos-hostauth, enables kerberos host auth
+        --kerberos-deleg, enables kerberos delegation
     """
     arguments = _parse_arguments(args)
     # Remove all "None" input values
